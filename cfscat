@@ -1,0 +1,126 @@
+#!/bin/sh
+
+# Cold file-system cataloging.  Scans a file-system to build a list of
+# directories and files.  Gives you the ability to list files or
+# search amongst them (by name) even when file-system is not available
+#
+# Tailored for FreeBSD.
+
+# Path to directory, where configuration and database files are kept.
+# Configuration file is same syntax as /etc/locate.rc and is named
+# after <volumename>.rc, database file is the one, created by
+# updatedb, and is named after <volumename>.database
+dbpath=~/.cfscat
+
+usage() {
+    echo "Usage: cfscat [-d dbpath]"
+    echo "              volumes"
+    echo "              scan <location> [<volname>]"
+    echo "              update <volname>"
+    echo "              ls <volname>[:path]"
+    echo "              locate|q <pattern>"
+    exit 0
+}
+die() {
+    echo "cfscat: $*" 1>&2
+    exit 1
+}
+
+# List scanned/known data volumes
+cmd_volumes() {
+    local _db
+    for _db in ${dbpath}/*.database; do
+	local _volname="${_db##*/}"
+	_volname="${_volname%.database}"
+	local _info="$(cat ${dbpath}/${_volname}.df)"
+	local _last="$(stat -f %Sm ${_db})"
+	echo ${_volname}: ${_info} ${_last}
+    done
+}
+
+# Scan or update data volumes
+cmd_scan() {
+    [ $# -eq 0 ] && usage
+    local _loc="$1"
+    [ -d "${_loc}" || die "directory '${_loc}' is not available"
+    local _volname
+    [ $# -gt 1 ] && _volname="$2" || _volname="${_loc##*/}"
+    # XXX: if _volname is not provided scan volumes for this location
+    # XXX: _volname sanitization?
+    # XXX: undo on error
+
+    local _rc=${dbpath}/${_volname}.rc
+    local _db=${dbpath}/${_volname}.database
+    local _info=${dbpath}/${_volname}.df
+    [ -s ${_rc} ] && mv -f ${_rc} ${_rc}~
+    [ -s ${_db} ] && mv -f ${_db} ${_db}~
+    [ -s ${_info} ] && mv -f ${_info} ${_info}~
+    cat > ${_rc} <<EOF
+FCODES=${_db}
+SEARCHPATHS=${_loc}
+EOF
+    LOCATE_CONFIG=${_rc} /usr/libexec/locate.updatedb
+    df -Th ${_loc} | tail -n +2 | xargs > ${_info}
+}
+
+# Update a data volume
+cmd_update() {
+    [ $# -eq 1 ] || usage
+    local _volname="$1"
+    local _rc=${dbpath}/${_volname}.rc
+    [ -s ${_rc} ] || die "no volume named '${_volname}'"
+    . ${_rc} # get SEARCHPATHS
+    [ -d "${SEARCHPATHS}" ] || die "directory '${SEARCHPATHS}' is not available"
+    cmd_scan "${SEARCHPATHS}" "${_volname}"
+}
+
+# Print a list of files in given location
+cmd_ls() {
+    [ $# -eq 0 ] && usage
+    local _volname="${1%%:*}"
+    local _loc="${*#*:}"
+    [ "${_loc}" = "${_volname}" ] && _loc=
+    [ ! -z "${_loc}" ] && _loc="${_loc%%/}/"
+    local _rc=${dbpath}/${_volname}.rc
+    [ ! -s ${_rc} ] && die "no volume named '${_volname}'"
+    . ${_rc} # need SEARCHPATHS to strip it from the output
+    local _db=${dbpath}/${_volname}.database
+    locate -d ${_db} "${_loc}" | grep "^${SEARCHPATHS}/${_loc}[^/]*$" | \
+	sed -e "s|${SEARCHPATHS}/||"
+}
+
+# Search for a pattern
+cmd_locate() {
+    [ $# -eq 0 ] && usage
+    local _db
+    for _db in ${dbpath}/*.database; do
+	local _volname="${_db##*/}"
+	_volname="${_volname%.database}"
+	local _rc="${_db%.database}.rc"
+	[ -s "${_rc}" ] || continue
+	. ${_rc}
+	locate -i -d ${_db} "$@" | sed -e "s|^${SEARCHPATHS}/|${_volname}:|"
+    done
+}
+cmd_q() {
+    cmd_locate "$@"
+}
+
+[ $# -gt 0 ] || usage
+while getopts d:h opt; do
+    case ${opt} in
+	(d) dbpath=${OPTARG};;
+	(h) usage;;
+	(*) exit 1;;
+    esac
+done
+shift $((OPTIND-1))
+[ $# -gt 0 ] || usage
+cmd="$1"
+shift
+
+mkdir -p "${dbpath}"
+case "${cmd}" in
+    (volumes|scan|update|ls|locate|q) eval cmd_${cmd} "$@";;
+    (*) echo "Illegal command '${cmd}'" 1>&2 && exit 1;;
+esac
