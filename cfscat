@@ -42,7 +42,7 @@ cmd_volumes() {
 cmd_scan() {
     [ $# -eq 0 ] && usage
     local _loc="$1"
-    [ -d "${_loc}" || die "directory '${_loc}' is not available"
+    [ -d "${_loc}" ] || die "directory '${_loc}' is not available"
     local _volname
     [ $# -gt 1 ] && _volname="$2" || _volname="${_loc##*/}"
     # XXX: if _volname is not provided scan volumes for this location
