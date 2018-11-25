@@ -18,6 +18,7 @@ and label them as `music-hdd` volume. Later, when you unmount it, you
 can still see a list of files there with
 
     $ cfscat ls music-hdd
+    $ cfscat hier music-hdd | less
 
 or search for your Bach records with
 
