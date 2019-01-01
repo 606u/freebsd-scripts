@@ -1,0 +1,309 @@
+#!/bin/sh
+
+# ZFS encrypted, incremental, remote backups
+#
+# Uses ZFS snapshots and zfs send to generate full snapshot backups
+# and incremental snapshot-to-snapshot deltas.  Able to create
+# snapshots by itself (-s command-line flag) or can use snapshots,
+# created by 3rd party, as long as names match to configured name
+# prefix and timestamp format.
+#
+# zfs send streams are compressed with gzip -9. That can be changed
+# via |compress| variable below.
+#
+# Compressed stream is encrypted with passphrase-protected AES256
+# cipher, using GnuPG. That can be changed via |encrypt| variable
+# below.
+#
+# Encrypted stream is sent to a remote location via ssh. For this to
+# be possible from a non-interactive script, a private/public key
+# should be first generated and installed on the remote location.
+# Take a look at
+# https://duckduckgo.com/?q=ssh+public+key+authentication for more
+# information.
+#
+# What you need to keep or else!:
+#   * ssh private key in ~/.ssh
+#   * file, where passphrase is, or passphrase itself
+
+# TODO:
+#
+#  * rollback of a snapshot, created by us, upon pipeline failure;
+#
+#  * add command-line option for restore;
+
+# Defaults (and some debugging leftovers)
+#destination=storage:/srv/bobi/backups/bb
+#passphrase=/root/.bb-backups-passphrase
+#datasets="tank/ezjail/cdns"
+#datasets="tank/ezjail/syncthing"
+#datasets="tank/timemachine tank/ezjail/tm"
+pidfile=/var/run/zfsautobackup.pid
+dobackup=1		  # perform backup stage
+doprunebackups=1
+managesnapshots=0	# whether script to create & destroy snapshots
+self=zfsautobackup
+
+usage() {
+    echo "Usage: ${self} [-s] -o <host:/path> -p /path/to/passphrase.txt"
+    echo "                     <dataset1> [<dataset2>...]"
+}
+
+while getopts so:p:h opt; do
+    case ${opt} in
+	(s) managesnapshots=1;;
+	(o) destination=${OPTARG};;
+	(p) passphrase=${OPTARG};;
+	(h) usage; exit 0;;
+	(*) exit 1;;
+    esac
+done
+shift $((OPTIND-1))
+datasets="$*"
+[ -z "${destination}" -o -z "${passphrase}" -o -z "${datasets}" ] && \
+    usage && exit 1
+
+: ${compress:=/usr/bin/gzip -9} # pigz?
+: ${encrypt:=/usr/local/bin/gpg --no-greeting --symmetric --cipher-algo AES256 --passphrase-file ${passphrase} --no-secmem-warning}
+# # of snapshots between two full backups
+: ${fullbackupitv:=14}
+# snapshot name prefix
+: ${snapshotprefix:=bak-}
+# timestamp format from date(1); should place oldest entries first
+# when names are piped via sort(1)
+: ${snapshottsfmt:=%Y%m%d-%H%M}
+desthost=${destination%%:*}
+destpath=${destination#*:}
+
+warn=WARNING:
+err=ERROR:
+[ -t 1 ] && warn=$'\033[1m'${warn}$'\033[0m' && err=$'\033[1m'${err}$'\033[0m'
+
+tell() {
+    local fmt=$1
+    shift
+    printf "%s: ${fmt}\n" ${self} "$@" 1>&2
+}
+
+# Test if a zfsautobackup instance is currently running
+if [ -s ${pidfile} ] ; then
+    pid=`cat ${pidfile}`
+    kill -0 ${pid} 2>/dev/null
+    if [ $? -eq 0 ] ; then
+	tell "${err} zfsautobackup is currently running with pid %d" ${pid}
+	exit 1
+    fi
+fi
+echo $$ > ${pidfile}
+
+# Handle interrupt or kill gracefully, stop child processes, as well
+pidlist=
+workdir=`/usr/bin/mktemp -d`
+atexit() {
+#    echo "in atexit($*)"
+    [ ! -z "${pidlist}" ] && kill ${pidlist}
+    pidlist=
+    [ ! -z "${workdir}" -a -d "${workdir}" ] && rm -fR "${workdir}"
+    workdir=
+}
+trap atexit EXIT INT TERM
+/usr/bin/mkfifo ${workdir}/zfssend ${workdir}/compress ${workdir}/encrypt
+
+# 1: <dataset>
+getremotelist() {
+    local filenameprefix=`echo ${1} | tr / -`
+    /usr/bin/ssh ${desthost} find ${destpath}/ -name ${filenameprefix}-\\\* 2>/dev/null | sort > ${workdir}/remotelist
+}
+
+# Deletes all snapshots from ${workdir}/snapshots
+dropsnapshots() {
+    local name
+    sort -r ${workdir}/snapshots | while read name; do
+	/sbin/zfs destroy ${name}
+    done
+}
+
+# 1: <dataset> (pool/dataset)
+backup() {
+    local i=$1
+    local pool=${i%%/*}
+    local dataset=${i#*/}
+    local filenameprefix=`echo ${i} | tr / -`
+    local snapshotname
+    local fromsnapshot
+    local remotepath
+
+    # XXX: Doesn't cover all conversion specifications from
+    # strftime(3). Using slash as delimiter for sed(1) is also unwise
+    local pattern=`echo ${snapshottsfmt} | sed -e s/%Y/[[:digit:]][[:digit:]][[:digit:]][[:digit:]]/ -e s/%[mdHMS]/[[:digit:]][[:digit:]]/g`
+    pattern=@${snapshotprefix}${pattern}
+    /sbin/zfs list -t snapshot -r -H -o name ${i} | grep -E ${pattern} | sort > ${workdir}/snapshots
+
+    # Decide whether to do full or incremental backup
+    local n=`cat ${workdir}/remotelist | wc -l`
+    tell "%d backup(s) of '%s' found at '%s':" ${n} ${i} ${desthost}
+    # cat ${workdir}/remotelist | rev | cut -d/ -f1 | rev
+    local multipleto=$((n%fullbackupitv))
+    local fullbackup=0
+    [ ${multipleto} -gt 0 ] || fullbackup=1
+
+    if [ ${managesnapshots} -gt 0 ] ; then
+	# Make a new snapshot
+	
+	snapshotname=${snapshotprefix}`date +${snapshottsfmt}`
+	grep -q ${snapshotname} ${workdir}/snapshots
+	if [ $? -eq 0 ] ; then
+	    # Such snapshot already exists; bail out
+	    tell "${warn} skipping backup of dataset '%s': snapshot '%s' already exists" ${i} ${snapshotname}
+	    return 1
+	fi
+
+	# Drop all intermediate snapshots as they only inflate full
+	# backup (will also include all deleted since first snapshot)
+	[ ${fullbackup} -eq 0 ] || dropsnapshots
+
+	/sbin/zfs snapshot -r ${i}@${snapshotname}
+	local xc=$?
+	if [ ${xc} -gt 0 ] ; then
+	    tell "${warn} failure snapshotting dataset '%s' as '%s', exit code %d" ${i} ${snapshotname} ${xc}
+	    return 1
+	fi
+    else
+	# Get the last snapshot matching to our pattern.
+	snapshotname=`tail -1 ${workdir}/snapshots`
+
+	if [ -z "${snapshotname}" ] ; then
+	    tell "${warn} skipping backup of dataset '%s': no matching snapshots found" ${i}
+	    return 1
+	fi
+	snapshotname=${snapshotname##*@}
+    fi
+
+    if [ ${fullbackup} -eq 0 ] ; then
+	# This backup to be incremental; the last remote snapshot is?
+	local lastfile=`tail -1 ${workdir}/remotelist`
+	lastfile=${lastfile##*/}  # strip directory from path name
+	local last=${lastfile%.*} # strip extension, .full or .incr
+	last=${last#${filenameprefix}-} # strip dataset name & snapshotprefix
+	tell "last backup of '%s' at '%s' is snapshot '%s' (%s)" \
+	     ${i} ${desthost} ${last} ${lastfile}
+
+	if [ "${snapshotname}" = "${last}" ] ; then
+	    tell "${warn} skipping incremental backup of dataset '%s': no snapshot newer than '%s' found" ${i} ${last}
+	    return 1
+	fi
+
+	grep -q @${last} ${workdir}/snapshots
+	if [ $? -eq 0 ] ; then
+	    fromsnapshot="-i ${i}@${last}"
+	    remotepath=${destpath}/${filenameprefix}-${snapshotname}.incr
+	    tell "starting incremental backup of '%s', delta from '%s' to '%s', to '%s'" ${i} ${last} ${snapshotname} ${desthost}
+	else
+	    # Snapshot our incremental backup should be based on does
+	    # not exist, therefore promote backup to full
+	    tell "promoting incremental backup of '%s' to full, as snapshot '%s' does not exist" ${i} ${snapshotname}
+	    fullbackup=1
+	fi
+    fi
+    if [ ${fullbackup} -gt 0 ] ; then
+	# Time to make a full backup
+	fromsnapshot=
+	remotepath=${destpath}/${filenameprefix}-${snapshotname}.full
+	tell "starting full backup of '%s', snapshot '%s', to '%s'" \
+	     ${i} ${snapshotname} ${desthost}
+    fi
+
+    # Create a manual pipeline so it would be possible to read the
+    # exit status of each command in the pipe
+    #
+    # XXX: Better to use shell redirects 3>&1... if only it were clear
+    # if that would suffice and how to use them
+    pidlist=
+
+    /sbin/zfs send -R ${fromsnapshot} ${i}@${snapshotname} >${workdir}/zfssend &
+    pidlist="${pidlist} $!"
+    local zfssendpid=$!
+
+    ${compress} <${workdir}/zfssend >${workdir}/compress &
+    pidlist="${pidlist} $!"
+    local compresspid=$!
+
+    ${encrypt} <${workdir}/compress >${workdir}/encrypt &
+    pidlist="${pidlist} $!"
+    local encryptpid=$!
+
+    # Last command does not run in the pipeline as this will save us a
+    # "wait", besides we can get its exit code immediately
+
+    # Notice that command writes to a temporary file on the other end
+    /usr/bin/ssh ${desthost} "cat > ${remotepath}\\#" <${workdir}/encrypt
+    local sshxc=$?    
+
+    wait ${zfssendpid}
+    local zfssendxc=$?
+
+    wait ${compresspid}
+    local compressxc=$?
+
+    wait ${encryptpid}
+    local encryptxc=$?
+
+    pidlist=
+    if [ ${zfssendxc} -eq 0 -a ${compressxc} -eq 0 -a ${encryptxc} -eq 0 -a ${sshxc} -eq 0 ] ; then
+	# All commands from the pipeline exitted successfully, commit
+	# output filename
+	/usr/bin/ssh ${desthost} "mv ${remotepath}\\# ${remotepath}"
+	echo ${remotepath} >> ${workdir}/remotelist
+	return 0
+    else
+	tell "${warn} exit codes for zfs send is %d, compress %d, encrypt %d, ssh %d" ${zfssendxc} ${compressxc} ${encryptxc} ${sshxc}
+	/usr/bin/ssh ${desthost} "rm -f ${remotepath}\\#"
+
+	# Destroy snapshot as it is not referenced
+	[ ${managesnapshots} -eq 0 ] || \
+	    /sbin/zfs destroy ${snapshotname}
+	return 1
+    fi
+}
+
+# 1: <dataset>
+prunebackups() {
+    # XXX: Decide on data-retention policy. At this time drop
+    # everything until last full backup
+    local last=`grep \\.full\$ ${workdir}/remotelist | tail -1`
+    if [ ! -z "${last}" ] ; then
+	tell "last full backup of '%s' at '%s' is '%s'" \
+	     $1 ${desthost} ${last##*/}
+	local list=
+	local name
+	local n=0
+	while read name; do
+	    [ ! ${name} = ${last} ] || break
+	    list="${list} ${name}"
+	    n=$((n+1))
+	done < ${workdir}/remotelist
+	if [ ! -z "${list}" ] ; then
+	    tell "deleting %d old backup(s)" ${n}
+	    /usr/bin/ssh ${desthost} rm -f ${list}
+	fi
+    else
+	tell "${warn} no full backups of dataset '%s' found at '%s'" \
+	     $1 ${desthost}
+    fi
+}
+
+for i in ${datasets}; do
+    tell "processing dataset '%s'..." ${i}
+    getremotelist ${i}
+
+    if [ ${dobackup} -gt 0 ] ; then
+	tell "initiating backup of dataset '%s'" ${i}
+	backup ${i} || \
+	    tell "${warn} dataset '%s' was NOT successfully backed up" ${i}
+    fi
+
+    if [ ${doprunebackups} -gt 0 ] ; then
+	tell "pruning old remote backups of dataset '%s' at '%s'" ${i} ${desthost}
+	prunebackups ${i}
+    fi
+done
